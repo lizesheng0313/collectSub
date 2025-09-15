@@ -52,42 +52,42 @@ jobs:
                 self.source_repo = "gooooooooooooogle/collectSub"
                 
             def get_latest_collectsub_data(self):
-                """获取collectSub项目的最新数据"""
+                """获取collectSub项目的config.yaml数据"""
                 try:
-                    # 获取最新年份
-                    api_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub"
-                    response = requests.get(api_url, timeout=10)
-                    
+                    # 直接获取config.yaml文件
+                    config_url = f"https://raw.githubusercontent.com/{self.source_repo}/main/config.yaml"
+                    response = requests.get(config_url, timeout=10)
+
                     if response.status_code == 200:
-                        years = [item['name'] for item in response.json() if item['type'] == 'dir']
-                        latest_year = sorted(years)[-1]
-                        
-                        # 获取最新月份
-                        month_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub/{latest_year}"
-                        month_response = requests.get(month_url, timeout=10)
-                        
-                        if month_response.status_code == 200:
-                            months = [item['name'] for item in month_response.json() if item['type'] == 'dir']
-                            latest_month = sorted(months)[-1]
-                            
-                            # 获取最新的YAML文件
-                            files_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub/{latest_year}/{latest_month}"
-                            files_response = requests.get(files_url, timeout=10)
-                            
-                            if files_response.status_code == 200:
-                                files = [item for item in files_response.json() if item['name'].endswith('.yaml')]
-                                if files:
-                                    # 获取最新的YAML文件
-                                    latest_file = sorted(files, key=lambda x: x['name'])[-1]
-                                    yaml_url = latest_file['download_url']
-                                    
-                                    yaml_response = requests.get(yaml_url, timeout=10)
-                                    if yaml_response.status_code == 200:
-                                        data = yaml.safe_load(yaml_response.text)
-                                        logger.info(f"成功获取最新数据: {latest_file['name']}")
-                                        return data
+                        data = yaml.safe_load(response.text)
+                        logger.info("成功获取config.yaml数据")
+
+                        # 转换为兼容格式
+                        tg_channels = data.get('tgchannel', [])
+
+                        # 从Telegram频道获取订阅链接
+                        subscription_urls = []
+                        for channel in tg_channels[:10]:  # 限制前10个频道
+                            try:
+                                channel_name = channel.split("/")[-1]
+                                channel_url = f'https://t.me/s/{channel_name}'
+
+                                resp = requests.get(channel_url, timeout=10)
+                                if resp.status_code == 200:
+                                    import re
+                                    urls = re.findall(r"https?://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]", resp.text)
+                                    subscription_urls.extend(urls[:5])  # 每个频道最多5个链接
+                            except:
+                                continue
+
+                        # 返回兼容格式
+                        return {
+                            'v2订阅': subscription_urls[:20],
+                            'clash订阅': subscription_urls[:20]
+                        }
+
                 except Exception as e:
-                    logger.error(f"获取collectSub数据失败: {e}")
+                    logger.error(f"获取config数据失败: {e}")
                 return None
                 
             def parse_vmess(self, vmess_url):

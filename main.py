@@ -4,32 +4,16 @@ import yaml
 import threading
 import base64
 import requests
+import json
+import time
 from loguru import logger
 from tqdm import tqdm
 from retry import retry
 
 from pre_check import pre_check
 
-new_sub_list = []
-new_clash_list = []
-new_v2_list = []
-
-@logger.catch
-def yaml_check(path_yaml):
-    print(os.path.isfile(path_yaml))
-    if os.path.isfile(path_yaml): #存在，非第一次
-        with open(path_yaml,encoding="UTF-8") as f:
-            dict_url = yaml.load(f, Loader=yaml.FullLoader)
-    else:
-        dict_url = {
-            "机场订阅":[],
-            "clash订阅":[],
-            "v2订阅":[]
-        }
-    # with open(path_yaml, 'w',encoding="utf-8") as f:
-    #     data = yaml.dump(dict_url, f,allow_unicode=True)
-    logger.info('读取文件成功')
-    return dict_url
+# 存储可用的代理 IP
+working_proxies = []
 
 @logger.catch
 def get_config():
@@ -76,89 +60,172 @@ def get_channel_http(channel_url):
 #     finally:
 #         return url_list
 
-def filter_base64(text):
-    ss = ['ss://','ssr://','vmess://','trojan://']
-    for i in ss:
-        if i in text:
-            return True
-    return False
+def parse_vmess(vmess_url):
+    """解析vmess链接"""
+    try:
+        vmess_data = vmess_url.replace('vmess://', '')
+        decoded = base64.b64decode(vmess_data + '==').decode('utf-8')
+        config = json.loads(decoded)
+        return {
+            'type': 'vmess',
+            'host': config.get('add', ''),
+            'port': int(config.get('port', 0)),
+            'id': config.get('id', ''),
+            'aid': config.get('aid', 0),
+            'net': config.get('net', 'tcp'),
+            'path': config.get('path', ''),
+            'host_header': config.get('host', ''),
+            'tls': config.get('tls', ''),
+            'ps': config.get('ps', '')
+        }
+    except:
+        return None
+
+def parse_ss(ss_url):
+    """解析ss链接"""
+    try:
+        # ss://method:password@host:port#name
+        ss_data = ss_url.replace('ss://', '')
+        if '#' in ss_data:
+            ss_data, name = ss_data.split('#', 1)
+        else:
+            name = ''
+
+        if '@' in ss_data:
+            method_pass, host_port = ss_data.split('@', 1)
+            if ':' in host_port:
+                host, port = host_port.rsplit(':', 1)
+                if ':' in method_pass:
+                    method, password = method_pass.split(':', 1)
+                else:
+                    # Base64编码的method:password
+                    decoded = base64.b64decode(method_pass + '==').decode('utf-8')
+                    method, password = decoded.split(':', 1)
+
+                return {
+                    'type': 'ss',
+                    'host': host,
+                    'port': int(port),
+                    'method': method,
+                    'password': password,
+                    'name': name
+                }
+    except:
+        return None
+
+def parse_trojan(trojan_url):
+    """解析trojan链接"""
+    try:
+        # trojan://password@host:port#name
+        trojan_data = trojan_url.replace('trojan://', '')
+        if '#' in trojan_data:
+            trojan_data, name = trojan_data.split('#', 1)
+        else:
+            name = ''
+
+        if '@' in trojan_data:
+            password, host_port = trojan_data.split('@', 1)
+            if ':' in host_port:
+                host, port = host_port.rsplit(':', 1)
+                return {
+                    'type': 'trojan',
+                    'host': host,
+                    'port': int(port),
+                    'password': password,
+                    'name': name
+                }
+    except:
+        return None
 
 
 @logger.catch
-def sub_check(url,bar):
+def parse_subscription(url, bar):
+    """解析订阅链接获取代理列表"""
     headers = {'User-Agent': 'ClashforWindows/0.18.1'}
     with thread_max_num:
         @retry(tries=2)
         def start_check(url):
-            res=requests.get(url,headers=headers,timeout=5)#设置5秒超时防止卡死
+            res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                try: #有流量信息
-                    info = res.headers['subscription-userinfo']
-                    info_num = re.findall('\d+',info)
-                    new_sub_list.append(url)
+                content = res.text
+
+                # 尝试Base64解码
+                try:
+                    decoded = base64.b64decode(content + '==').decode('utf-8')
+                    content = decoded
                 except:
-                    # 判断是否为clash
-                    try:
-                        u = re.findall('proxies:', res.text)[0]
-                        if u == "proxies:":
-                            new_clash_list.append(url)
-                    except:
-                        # 判断是否为v2
-                        try:
-                            # 解密base64
-                            text = res.text[:64]
-                            text = base64.b64decode(text)
-                            text = str(text)
-                            if filter_base64(text):
-                                new_v2_list.append(url)
-                        # 均不是则非订阅链接
-                        except:
-                            pass
-            else:
-                pass
+                    pass
+
+                # 解析各种协议的代理
+                lines = content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('vmess://'):
+                        proxy = parse_vmess(line)
+                        if proxy and proxy.get('host') and proxy.get('port'):
+                            working_proxies.append(proxy)
+                    elif line.startswith('ss://'):
+                        proxy = parse_ss(line)
+                        if proxy and proxy.get('host') and proxy.get('port'):
+                            working_proxies.append(proxy)
+                    elif line.startswith('trojan://'):
+                        proxy = parse_trojan(line)
+                        if proxy and proxy.get('host') and proxy.get('port'):
+                            working_proxies.append(proxy)
+
         try:
             start_check(url)
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"解析订阅失败 {url}: {e}")
         bar.update(1)
 
 if __name__=='__main__':
-    path_yaml = pre_check()
-    dict_url = yaml_check(path_yaml)
-    # print(dict_url)
+    output_file = pre_check()
     list_tg = get_config()
     logger.info('读取config成功')
-    #循环获取频道订阅
+
+    # 循环获取频道订阅链接
     url_list = []
     for channel_url in list_tg:
         temp_list = get_channel_http(channel_url)
         url_list.extend(temp_list)
-    logger.info('开始筛选---')
+
+    logger.info(f'开始解析 {len(url_list)} 个订阅链接')
     thread_max_num = threading.Semaphore(32)  # 32线程
-    bar = tqdm(total=len(url_list), desc='订阅筛选：')
+    bar = tqdm(total=len(url_list), desc='解析订阅：')
     thread_list = []
+
     for url in url_list:
-        # 为每个新URL创建线程
-        t = threading.Thread(target=sub_check, args=(url, bar))
-        # 加入线程池并启动
+        # 为每个订阅URL创建线程
+        t = threading.Thread(target=parse_subscription, args=(url, bar))
         thread_list.append(t)
         t.setDaemon(True)
         t.start()
+
     for t in thread_list:
         t.join()
     bar.close()
-    logger.info('筛选完成')
-    old_sub_list = dict_url['机场订阅']
-    old_clash_list = dict_url['clash订阅']
-    old_v2_list = dict_url['v2订阅']
-    new_sub_list.extend(old_sub_list)
-    new_clash_list.extend(old_clash_list)
-    new_v2_list.extend(old_v2_list)
-    new_sub_list = list(set(new_sub_list))
-    new_clash_list = list(set(new_clash_list))
-    new_v2_list = list(set(new_v2_list))
-    dict_url.update({'机场订阅':new_sub_list})
-    dict_url.update({'clash订阅': new_clash_list})
-    dict_url.update({'v2订阅': new_v2_list})
-    with open(path_yaml, 'w',encoding="utf-8") as f:
-        data = yaml.dump(dict_url, f,allow_unicode=True)
+
+    logger.info(f'解析完成，共获得 {len(working_proxies)} 个代理')
+
+    # 去重
+    unique_proxies = []
+    seen = set()
+    for proxy in working_proxies:
+        key = f"{proxy.get('host')}:{proxy.get('port')}"
+        if key not in seen:
+            seen.add(key)
+            unique_proxies.append(proxy)
+
+    # 保存到JSON文件
+    result = {
+        'update_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'count': len(unique_proxies),
+        'proxies': unique_proxies,
+        'source': 'collectSub-local'
+    }
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    logger.info(f'结果已保存到 {output_file}，共 {len(unique_proxies)} 个唯一代理')
