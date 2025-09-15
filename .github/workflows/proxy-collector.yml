@@ -72,15 +72,18 @@ jobs:
                                 channel_name = channel.split("/")[-1]
                                 channel_url = f'https://t.me/s/{channel_name}'
 
-                                resp = requests.get(channel_url, timeout=10)
+                                resp = requests.post(channel_url, timeout=10)  # 改为POST请求
                                 if resp.status_code == 200:
                                     import re
                                     urls = re.findall(r"https?://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]", resp.text)
                                     subscription_urls.extend(urls[:5])  # 每个频道最多5个链接
-                            except:
+                                    logger.info(f"从 {channel_name} 获取到 {len(urls)} 个链接")
+                            except Exception as e:
+                                logger.debug(f"获取频道 {channel} 失败: {e}")
                                 continue
 
                         # 返回兼容格式
+                        logger.info(f"总共获取到 {len(subscription_urls)} 个订阅链接")
                         return {
                             'v2订阅': subscription_urls[:20],
                             'clash订阅': subscription_urls[:20]
@@ -88,7 +91,20 @@ jobs:
 
                 except Exception as e:
                     logger.error(f"获取config数据失败: {e}")
-                return None
+
+                # 备用数据源：一些公开的订阅链接
+                logger.info("使用备用数据源...")
+                backup_urls = [
+                    "https://raw.githubusercontent.com/openRunner/clash-freenode/main/clash.yaml",
+                    "https://raw.githubusercontent.com/vpei/Free-Node-Merge/main/out/clash.yaml",
+                    "https://raw.githubusercontent.com/tbbatbb/Proxy/master/dist/clash.config.yaml",
+                    "https://raw.githubusercontent.com/chfchf0306/clash/main/clash",
+                    "https://gitlab.com/ripaojiedian/freenode/-/raw/main/clash"
+                ]
+                return {
+                    'v2订阅': backup_urls,
+                    'clash订阅': backup_urls
+                }
                 
             def parse_vmess(self, vmess_url):
                 """解析vmess://链接"""
@@ -223,6 +239,7 @@ jobs:
                 # 解析订阅获取代理
                 for sub_url in subscription_urls:
                     proxies = self.parse_subscription(sub_url)
+                    logger.info(f"从 {sub_url} 解析到 {len(proxies)} 个代理")
                     all_proxies.extend(proxies)
                     if len(all_proxies) > 100:  # 限制总数
                         break
@@ -301,19 +318,13 @@ jobs:
                 'update_time': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'count': len(working_proxies),
                 'proxies': working_proxies,
-                'api_saved': api_success,
-                'source': 'collectSub-enhanced'
+                'source': 'collectSub-tested'
             }
             
             with open('collected_proxies.json', 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
                 
-            logger.info("结果已保存到 collected_proxies.json")
-            
-            if api_success:
-                logger.success("✓ 数据已成功入库")
-            else:
-                logger.warning("✗ 数据入库失败，请检查API配置")
+            logger.info(f"结果已保存到 collected_proxies.json，共 {len(working_proxies)} 个可用代理")
         EOF
         
     - name: Run proxy collector

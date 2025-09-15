@@ -6,12 +6,16 @@ import base64
 import requests
 import json
 import time
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from tqdm import tqdm
 from retry import retry
 
 from pre_check import pre_check
 
+# 存储解析出的代理配置
+all_proxies = []
 # 存储可用的代理 IP
 working_proxies = []
 
@@ -163,21 +167,32 @@ def parse_subscription(url, bar):
                     if line.startswith('vmess://'):
                         proxy = parse_vmess(line)
                         if proxy and proxy.get('host') and proxy.get('port'):
-                            working_proxies.append(proxy)
+                            all_proxies.append(proxy)
                     elif line.startswith('ss://'):
                         proxy = parse_ss(line)
                         if proxy and proxy.get('host') and proxy.get('port'):
-                            working_proxies.append(proxy)
+                            all_proxies.append(proxy)
                     elif line.startswith('trojan://'):
                         proxy = parse_trojan(line)
                         if proxy and proxy.get('host') and proxy.get('port'):
-                            working_proxies.append(proxy)
+                            all_proxies.append(proxy)
 
         try:
             start_check(url)
         except Exception as e:
             logger.debug(f"解析订阅失败 {url}: {e}")
         bar.update(1)
+
+def test_proxy_connectivity(proxy):
+    """测试代理连通性"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        result = sock.connect_ex((proxy['host'], proxy['port']))
+        sock.close()
+        return result == 0
+    except:
+        return False
 
 if __name__=='__main__':
     output_file = pre_check()
@@ -206,26 +221,66 @@ if __name__=='__main__':
         t.join()
     bar.close()
 
-    logger.info(f'解析完成，共获得 {len(working_proxies)} 个代理')
+    logger.info(f'解析完成，共获得 {len(all_proxies)} 个代理配置')
 
     # 去重
     unique_proxies = []
     seen = set()
-    for proxy in working_proxies:
+    for proxy in all_proxies:
         key = f"{proxy.get('host')}:{proxy.get('port')}"
         if key not in seen:
             seen.add(key)
             unique_proxies.append(proxy)
 
-    # 保存到JSON文件
+    logger.info(f'去重后剩余 {len(unique_proxies)} 个代理，开始测试连通性...')
+
+    # 多线程测试代理连通性
+    max_workers = 20
+    target_count = min(50, len(unique_proxies))  # 最多测试50个
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 限制测试数量，避免测试时间过长
+        test_proxies = unique_proxies[:100] if len(unique_proxies) > 100 else unique_proxies
+
+        future_to_proxy = {
+            executor.submit(test_proxy_connectivity, proxy): proxy
+            for proxy in test_proxies
+        }
+
+        # 使用进度条显示测试进度
+        test_bar = tqdm(total=len(test_proxies), desc='测试连通性：')
+
+        for future in as_completed(future_to_proxy):
+            proxy = future_to_proxy[future]
+            try:
+                if future.result():
+                    working_proxies.append(proxy)
+                    logger.info(f"✓ 发现可用代理: {proxy['host']}:{proxy['port']} ({proxy['type']})")
+
+                    if len(working_proxies) >= target_count:
+                        # 取消剩余的任务
+                        for remaining_future in future_to_proxy:
+                            if not remaining_future.done():
+                                remaining_future.cancel()
+                        break
+            except Exception as e:
+                logger.debug(f"测试代理失败: {e}")
+            finally:
+                test_bar.update(1)
+
+        test_bar.close()
+
+    logger.info(f'连通性测试完成，找到 {len(working_proxies)} 个可用代理')
+
+    # 保存到JSON文件 - 只保留可用的代理
     result = {
         'update_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'count': len(unique_proxies),
-        'proxies': unique_proxies,
-        'source': 'collectSub-local'
+        'count': len(working_proxies),
+        'proxies': working_proxies,
+        'source': 'collectSub-tested'
     }
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    logger.info(f'结果已保存到 {output_file}，共 {len(unique_proxies)} 个唯一代理')
+    logger.info(f'结果已保存到 {output_file}，共 {len(working_proxies)} 个可用代理')
