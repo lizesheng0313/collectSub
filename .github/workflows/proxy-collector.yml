@@ -1,0 +1,331 @@
+name: Collect and Filter Proxies
+
+on:
+  schedule:
+    # 每4分钟运行一次
+    - cron: '*/4 * * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+jobs:
+  collect-proxies:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        pip install requests pyyaml loguru tqdm retry
+        
+    - name: Create proxy collector script
+      run: |
+        cat > proxy_collector.py << 'EOF'
+        import requests
+        import yaml
+        import base64
+        import json
+        import re
+        import time
+        import os
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from urllib.parse import urlparse, parse_qs
+        import socket
+        from loguru import logger
+        
+        class ProxyCollector:
+            def __init__(self):
+                self.working_proxies = []
+                self.test_url = "http://httpbin.org/ip"
+                self.timeout = 10
+                # 从环境变量获取API配置
+                self.api_url = os.getenv('API_URL', 'http://your-api-endpoint.com/api/proxies')
+                self.api_token = os.getenv('API_TOKEN', '')
+                # 使用gooooooooooooogle的仓库作为数据源
+                self.source_repo = "gooooooooooooogle/collectSub"
+                
+            def get_latest_collectsub_data(self):
+                """获取collectSub项目的最新数据"""
+                try:
+                    # 获取最新年份
+                    api_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub"
+                    response = requests.get(api_url, timeout=10)
+                    
+                    if response.status_code == 200:
+                        years = [item['name'] for item in response.json() if item['type'] == 'dir']
+                        latest_year = sorted(years)[-1]
+                        
+                        # 获取最新月份
+                        month_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub/{latest_year}"
+                        month_response = requests.get(month_url, timeout=10)
+                        
+                        if month_response.status_code == 200:
+                            months = [item['name'] for item in month_response.json() if item['type'] == 'dir']
+                            latest_month = sorted(months)[-1]
+                            
+                            # 获取最新的YAML文件
+                            files_url = f"https://api.github.com/repos/{self.source_repo}/contents/sub/{latest_year}/{latest_month}"
+                            files_response = requests.get(files_url, timeout=10)
+                            
+                            if files_response.status_code == 200:
+                                files = [item for item in files_response.json() if item['name'].endswith('.yaml')]
+                                if files:
+                                    # 获取最新的YAML文件
+                                    latest_file = sorted(files, key=lambda x: x['name'])[-1]
+                                    yaml_url = latest_file['download_url']
+                                    
+                                    yaml_response = requests.get(yaml_url, timeout=10)
+                                    if yaml_response.status_code == 200:
+                                        data = yaml.safe_load(yaml_response.text)
+                                        logger.info(f"成功获取最新数据: {latest_file['name']}")
+                                        return data
+                except Exception as e:
+                    logger.error(f"获取collectSub数据失败: {e}")
+                return None
+                
+            def parse_vmess(self, vmess_url):
+                """解析vmess://链接"""
+                try:
+                    encoded = vmess_url.replace('vmess://', '')
+                    decoded = base64.b64decode(encoded + '==').decode('utf-8')
+                    config = json.loads(decoded)
+                    
+                    return {
+                        'type': 'vmess',
+                        'host': config.get('add', ''),
+                        'port': int(config.get('port', 0)),
+                        'id': config.get('id', ''),
+                        'aid': config.get('aid', 0),
+                        'net': config.get('net', 'tcp'),
+                        'path': config.get('path', ''),
+                        'host_header': config.get('host', ''),
+                        'tls': config.get('tls', '')
+                    }
+                except Exception as e:
+                    logger.debug(f"解析vmess失败: {e}")
+                    return None
+                    
+            def parse_ss(self, ss_url):
+                """解析ss://链接"""
+                try:
+                    url = ss_url.replace('ss://', '')
+                    
+                    if '@' in url:
+                        auth_part, server_part = url.split('@', 1)
+                        
+                        try:
+                            decoded_auth = base64.b64decode(auth_part + '==').decode('utf-8')
+                            method, password = decoded_auth.split(':', 1)
+                        except:
+                            method, password = auth_part.split(':', 1)
+                            
+                        if '#' in server_part:
+                            server_part = server_part.split('#')[0]
+                        host, port = server_part.split(':')
+                        
+                        return {
+                            'type': 'ss',
+                            'host': host,
+                            'port': int(port),
+                            'method': method,
+                            'password': password
+                        }
+                    else:
+                        decoded = base64.b64decode(url + '==').decode('utf-8')
+                        method_password, server = decoded.split('@')
+                        method, password = method_password.split(':', 1)
+                        host, port = server.split(':')
+                        
+                        return {
+                            'type': 'ss',
+                            'host': host,
+                            'port': int(port),
+                            'method': method,
+                            'password': password
+                        }
+                except Exception as e:
+                    logger.debug(f"解析ss失败: {e}")
+                    return None
+                    
+            def parse_subscription(self, sub_url):
+                """解析订阅链接获取代理列表"""
+                proxies = []
+                try:
+                    headers = {'User-Agent': 'ClashforWindows/0.18.1'}
+                    response = requests.get(sub_url, timeout=15, headers=headers)
+                    
+                    if response.status_code == 200:
+                        content = response.text
+                        
+                        # 尝试Base64解码
+                        try:
+                            decoded = base64.b64decode(content + '==').decode('utf-8')
+                            content = decoded
+                        except:
+                            pass
+                            
+                        # 解析各种协议的代理
+                        lines = content.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if line.startswith('vmess://'):
+                                proxy = self.parse_vmess(line)
+                                if proxy and proxy['host'] and proxy['port']:
+                                    proxies.append(proxy)
+                            elif line.startswith('ss://'):
+                                proxy = self.parse_ss(line)
+                                if proxy and proxy['host'] and proxy['port']:
+                                    proxies.append(proxy)
+                                    
+                except Exception as e:
+                    logger.debug(f"解析订阅失败 {sub_url}: {e}")
+                    
+                return proxies
+                
+            def test_proxy_connectivity(self, proxy):
+                """测试代理连通性"""
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    result = sock.connect_ex((proxy['host'], proxy['port']))
+                    sock.close()
+                    return result == 0
+                except:
+                    return False
+                    
+            def collect_and_filter_proxies(self, max_workers=20, target_count=15):
+                """收集并筛选可用代理"""
+                logger.info("开始收集代理...")
+                
+                # 获取最新的collectSub数据
+                data = self.get_latest_collectsub_data()
+                if not data:
+                    logger.error("无法获取数据源")
+                    return []
+                
+                all_proxies = []
+                subscription_urls = []
+                
+                # 收集所有订阅URL
+                for category in ['v2订阅', 'clash订阅']:
+                    if category in data:
+                        subscription_urls.extend(data[category][:5])  # 限制每类前5个
+                
+                logger.info(f"开始解析 {len(subscription_urls)} 个订阅源...")
+                
+                # 解析订阅获取代理
+                for sub_url in subscription_urls:
+                    proxies = self.parse_subscription(sub_url)
+                    all_proxies.extend(proxies)
+                    if len(all_proxies) > 100:  # 限制总数
+                        break
+                        
+                logger.info(f"共解析到 {len(all_proxies)} 个代理，开始测试连通性...")
+                
+                # 多线程测试代理连通性
+                working_proxies = []
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_proxy = {
+                        executor.submit(self.test_proxy_connectivity, proxy): proxy 
+                        for proxy in all_proxies[:50]  # 限制测试数量
+                    }
+                    
+                    for future in as_completed(future_to_proxy):
+                        proxy = future_to_proxy[future]
+                        try:
+                            if future.result():
+                                working_proxies.append(proxy)
+                                logger.info(f"✓ 发现可用代理: {proxy['host']}:{proxy['port']} ({proxy['type']})")
+                                
+                                if len(working_proxies) >= target_count:
+                                    break
+                        except Exception as e:
+                            logger.debug(f"测试代理失败: {e}")
+                            
+                return working_proxies
+                
+            def save_to_api(self, proxies):
+                """调用API保存代理到数据库"""
+                if not self.api_url:
+                    logger.warning("未配置API_URL，跳过API调用")
+                    return False
+                    
+                try:
+                    headers = {
+                        'Content-Type': 'application/json',
+                        'User-Agent': 'GitHub-Action-Proxy-Collector/1.0'
+                    }
+                    
+                    if self.api_token:
+                        headers['Authorization'] = f'Bearer {self.api_token}'
+                    
+                    data = {
+                        'proxies': proxies,
+                        'update_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'count': len(proxies),
+                        'source': 'collectSub-github-action'
+                    }
+                    
+                    response = requests.post(self.api_url, json=data, headers=headers, timeout=30)
+                    
+                    if response.status_code == 200:
+                        logger.success(f"✓ 成功调用API入库，保存了 {len(proxies)} 个代理")
+                        return True
+                    else:
+                        logger.error(f"✗ API调用失败，状态码: {response.status_code}")
+                        logger.error(f"响应内容: {response.text}")
+                        return False
+                        
+                except Exception as e:
+                    logger.error(f"✗ API调用异常: {e}")
+                    return False
+                
+        if __name__ == "__main__":
+            collector = ProxyCollector()
+            working_proxies = collector.collect_and_filter_proxies()
+            
+            logger.info(f"\n收集完成，共找到 {len(working_proxies)} 个可用代理")
+            
+            # 调用API入库
+            api_success = collector.save_to_api(working_proxies)
+            
+            # 同时保存本地文件作为备份
+            result = {
+                'update_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'count': len(working_proxies),
+                'proxies': working_proxies,
+                'api_saved': api_success,
+                'source': 'collectSub-enhanced'
+            }
+            
+            with open('collected_proxies.json', 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+                
+            logger.info("结果已保存到 collected_proxies.json")
+            
+            if api_success:
+                logger.success("✓ 数据已成功入库")
+            else:
+                logger.warning("✗ 数据入库失败，请检查API配置")
+        EOF
+        
+    - name: Run proxy collector
+      run: python proxy_collector.py
+      env:
+        API_URL: ${{ secrets.API_URL }}
+        API_TOKEN: ${{ secrets.API_TOKEN }}
+      
+    - name: Commit and push results
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add collected_proxies.json
+        git commit -m "Update collected proxies $(date '+%Y-%m-%d %H:%M:%S')" || exit 0
+        git push
